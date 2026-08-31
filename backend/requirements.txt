@@ -1,0 +1,11 @@
+# Python dependencies for backend (use conda for cadquery)
+fastapi
+uvicorn[standard]
+pydantic
+python-multipart
+aiofiles
+cadquery
+opencv-python
+pytesseract
+svgpathtools
+shapely
