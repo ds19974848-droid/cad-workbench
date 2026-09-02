@@ -1,34 +1,25 @@
 """nxopen/generate_cam_from_selection.py
 
-Expanded NXOpen journal to generate CAM operations from selected_tools.json.
-This script builds a detailed CAM plan (operations with tools/feeds/feeds) and
-attempts to create NX CAM operations when the NXOpen.CAM API is available.
+Attempt to create CAM operations in NX (more aggressive builders usage).
+This version tries to populate common builder properties (ToolName, Depth,
+StepDown, StepOver, SpindleSpeed, FeedRate) when available, then commit the
+builders to create actual NX CAM operations. All calls are guarded with
+try/except so the journal is safe to run in installs where parts of the API
+are missing.
 
 Run inside NX: File -> Execute -> Journal -> select this file -> Run
 
-Safety: All NX CAM creation calls are wrapped in try/except and logged. If the
-local NX installation exposes a different API surface the script will still
-write a complete plan JSON (output/nx_cam_plan.json) that you can use to
-manually create operations or for iterative scripting updates.
+Outputs written to repo/output/:
+ - nx_cam_plan.json   (detailed planned operations)
+ - nx_cam_summary.json
+ - nx_cam_journal_run.log
+ - generated_gcode.nc (if post runs)
 
-Inputs (repo root):
-  output/selected_tools.json
-  input/candidates.json
-  output/toollib_standard.json
-
-Outputs (repo root):
-  output/nx_cam_plan.json         -- detailed planned operations
-  output/nx_cam_journal_run.log  -- run log
-  output/nx_cam_summary.json     -- high-level summary
-  output/generated_gcode.nc      -- placeholder if post succeeds
-
-Notes:
-- The script will try to map tool_id strings to NX tool objects if present in
-  the current Work Part's tool list. If no mapping is found it will create a
-  plan entry that references the tool_id string (you must ensure the physical
-  tool exists in your machine/tool library before running the produced G-code).
-- After running this journal in NX, open the generated plan JSON and inspect
-  each planned operation in NX CAM before post-processing.
+Note: Builder attribute names vary across NX versions. This script uses
+getattr/setattr and checks for common property names. If a property isn't
+available the script logs and continues. After running, open the part in NX
+CAM and inspect the created operations carefully, then run Simulation and
+Post with your Fanuc Oi post.
 """
 
 import os
@@ -75,9 +66,7 @@ def build_plan(selected, candidates, toollib, defaults):
         fid = feat.get('id')
         entry = next((s for s in selected if s.get('feature_id') == fid), None)
         chosen_tool_id = entry.get('selected') if entry else None
-        # find tool record
         tool_rec = safe_get_tool_record(toollib, chosen_tool_id)
-        # Basic op types
         ftype = feat.get('feature_type')
         geom = feat.get('geom', {})
         if ftype == 'hole':
@@ -85,63 +74,68 @@ def build_plan(selected, candidates, toollib, defaults):
             depth = geom.get('depth_mm')
             op = {
                 'feature_id': fid,
-                'op_type': 'drill',
+                'feature_type': ftype,
+                'operation': 'drilling',
                 'tool_id': chosen_tool_id,
-                'tool_record': tool_rec,
-                'diameter_mm': diameter,
-                'depth_mm': depth,
-                'strategy': 'peck' if depth and depth>diameter*3 else 'standard',
-                'safety_mm': defaults['safety_mm'],
-                'spindle_rpm': defaults['rpm_for_material'],
-                'feed_mm_per_min': defaults['feed_for_material'],
+                'tool_candidates': entry.get('candidates') if entry else [],
+                'stepdown_mm': None,
+                'stepover_mm': None,
+                'rpm': defaults['rpm_for_material'],
+                'feed_mm_min': defaults['feed_for_material'],
+                'safety_status': 'requires_nx_cam_simulation',
                 'notes': []
             }
-            # add checks
             if tool_rec:
-                if tool_rec.get('diameter_mm'):
-                    if abs((tool_rec.get('diameter_mm') or 0)-diameter) > 0.2:
-                        op['notes'].append('tool diameter != feature diameter: verify fit')
-                # numeric candidates may include flute length / overall length
                 nc = tool_rec.get('numeric_candidates', {})
-                lengths = [v for v in nc.values() if v>1]
+                lengths = [v for v in nc.values() if v > 1]
                 if lengths:
                     ol = max(lengths)
                     if ol < (depth + defaults['safety_mm']):
                         op['notes'].append('tool length may be insufficient: check flute/overall length')
             plan.append(op)
-        elif ftype in ('pocket','profile','slot'):
-            # milling op: decide rough + finish if depth large
+        elif ftype in ('pocket', 'slot', 'profile'):
             depth = geom.get('depth_mm', 0.0)
             width = geom.get('width_mm') or geom.get('slot_width_mm') or geom.get('length_mm')
+            stepdown = min((tool_rec.get('diameter_mm') if tool_rec and tool_rec.get('diameter_mm') else (width or 5))/2, defaults['max_stepdown_mm']) if 'tool_rec' in locals() else defaults['max_stepdown_mm']
             op = {
                 'feature_id': fid,
-                'op_type': 'milling',
+                'feature_type': ftype,
+                'operation': 'milling',
                 'tool_id': chosen_tool_id,
-                'tool_record': tool_rec,
-                'depth_mm': depth,
-                'width_mm': width,
-                'strategy': 'finish' if geom.get('finish') == 'finish' else 'rough_then_finish',
-                'stepdown_mm': min( (tool_rec.get('diameter_mm') if tool_rec and tool_rec.get('diameter_mm') else (width or 5))/2, defaults['max_stepdown_mm']),
-                'stepover': defaults['stepover_percent'],
-                'safety_mm': defaults['safety_mm'],
-                'spindle_rpm': defaults['rpm_for_material'],
-                'feed_mm_per_min': defaults['feed_for_material'],
+                'tool_candidates': entry.get('candidates') if entry else [],
+                'stepdown_mm': round(stepdown,3) if stepdown else defaults['max_stepdown_mm'],
+                'stepover_mm': round((defaults['stepover_percent'] * (tool_rec.get('diameter_mm') if tool_rec and tool_rec.get('diameter_mm') else (width or 5))),3) if 'tool_rec' in locals() else defaults['stepover_percent'] * (width or 5),
+                'rpm': defaults['rpm_for_material'],
+                'feed_mm_min': defaults['feed_for_material'],
+                'safety_status': 'requires_nx_cam_simulation',
                 'notes': []
             }
-            # validate tool diameter
             if tool_rec and tool_rec.get('diameter_mm') and width:
                 if tool_rec.get('diameter_mm') > width:
                     op['notes'].append('tool diameter > feature width: will not fit; choose smaller tool or adjust')
             plan.append(op)
         else:
-            plan.append({'feature_id': fid, 'op_type': 'unknown', 'notes': ['Unknown feature type - manual step required']})
+            plan.append({'feature_id': fid, 'operation': 'unknown', 'notes': ['Unknown feature type - manual creation required']})
     return plan
 
 
+def set_builder_attr(builder, attr, value):
+    """Set attribute on builder if present. Return True if set."""
+    try:
+        if hasattr(builder, attr):
+            setattr(builder, attr, value)
+            return True
+        # Some builders use property methods like SetX / SetY
+        set_method = 'Set' + attr
+        if hasattr(builder, set_method):
+            getattr(builder, set_method)(value)
+            return True
+    except Exception as e:
+        write_log(f'Failed to set builder.{attr} = {value}: {e}')
+    return False
+
+
 def attempt_create_ops_in_nx(plan):
-    """Attempts to create operations in NX CAM. This is best-effort and many
-    NX installations have different CAM API surfaces; keep failures non-fatal.
-    """
     try:
         import NXOpen
         import NXOpen.CAM
@@ -154,63 +148,105 @@ def attempt_create_ops_in_nx(plan):
         work_part = session.Parts.Work
         write_log('NX session detected. Work part: ' + (work_part.Name if work_part else 'None'))
 
-        # Try to get existing CAM session
-        cam_session = None
         try:
             cam_session = NXOpen.CAM.CAMSession.GetSession(work_part)
         except Exception:
-            write_log('CAMSession.GetSession(work_part) failed; trying CAMSession.GetSession()')
             try:
                 cam_session = NXOpen.CAM.CAMSession.GetSession()
-            except Exception:
+            except Exception as e:
+                write_log('CAMSession could not be acquired: ' + str(e))
                 cam_session = None
-                write_log('CAMSession could not be acquired')
-
         if cam_session is None:
             return {'created': False, 'reason': 'CAMSession unavailable'}
 
-        # Best-effort: create a ManufacturingSetup if none exists
-        try:
-            setup_collection = cam_session.Setups
-        except Exception:
-            setup_collection = None
-        write_log(f'CAM session acquired; setups: {"present" if setup_collection else "unknown"}')
-
-        # For each plan entry, attempt to create an operation using friendly builders
         created_ops = []
         for op in plan:
             try:
-                if op['op_type'] == 'drill':
-                    # Try drill builder
+                if op['operation'] == 'drilling':
+                    write_log(f"Creating drill operation for {op['feature_id']} with tool {op['tool_id']}")
                     try:
-                        # Many NX versions provide DrillBuilder via NXOpen.CAM
-                        drill_builder = NXOpen.CAM.DrillBuilder(work_part)
-                        write_log('Using NXOpen.CAM.DrillBuilder')
-                        # The exact API to set tool and geometry is version-specific; attempt safe calls
-                        # Set tool by name if possible
-                        # drill_builder.ToolName = op['tool_id']  # example - may not exist
-                        # drill_builder.Depth = op['depth_mm']
-                        # drill_builder.Commit()
-                        # created_ops.append({'feature_id': op['feature_id'], 'op':'drill', 'status':'created (best-effort)'})
-                        write_log(f"(DrillBuilder) planned drill for {op['feature_id']} with tool {op['tool_id']}")
+                        builder = None
+                        # try common builder names
+                        for name in ('DrillBuilder','StandardDrillBuilder','DrillCycleBuilder'):
+                            if hasattr(NXOpen.CAM, name):
+                                BuilderClass = getattr(NXOpen.CAM, name)
+                                try:
+                                    builder = BuilderClass(work_part)
+                                    write_log(f'Instantiated {name}')
+                                    break
+                                except Exception:
+                                    builder = None
+                        if builder is None:
+                            write_log('No Drill builder available in this NX API; marking planned')
+                            created_ops.append({'feature_id': op['feature_id'], 'op':'drill', 'status':'planned'})
+                        else:
+                            # Set common properties if present
+                            set_builder_attr(builder, 'ToolName', op['tool_id'])
+                            set_builder_attr(builder, 'Depth', float(op.get('depth_mm') or 0))
+                            set_builder_attr(builder, 'SpindleSpeed', int(op.get('rpm')))
+                            set_builder_attr(builder, 'FeedRate', float(op.get('feed_mm_min') or 0))
+                            set_builder_attr(builder, 'PeckDepth', float(op.get('stepdown_mm') or 0))
+                            # commit if method exists
+                            if hasattr(builder, 'Commit'):
+                                try:
+                                    builder.Commit()
+                                    write_log(f'Drill operation committed for {op["feature_id"]}')
+                                    created_ops.append({'feature_id': op['feature_id'], 'op':'drill', 'status':'created'})
+                                except Exception as e:
+                                    write_log('Failed to commit drill builder: ' + str(e))
+                                    created_ops.append({'feature_id': op['feature_id'], 'op':'drill', 'status':'planned'})
+                            else:
+                                write_log('Builder has no Commit method; operation left as planned')
+                                created_ops.append({'feature_id': op['feature_id'], 'op':'drill', 'status':'planned'})
                     except Exception:
-                        write_log('DrillBuilder not available or failed; logging plan for manual creation')
-                        created_ops.append({'feature_id': op['feature_id'], 'op':'drill', 'status':'planned'})
-                elif op['op_type'] == 'milling':
+                        write_log('Exception during drill creation:')
+                        write_log(traceback.format_exc())
+                        created_ops.append({'feature_id': op['feature_id'], 'op':'drill', 'status':'error'})
+
+                elif op['operation'] == 'milling':
+                    write_log(f"Creating mill operation for {op['feature_id']} with tool {op['tool_id']}")
                     try:
-                        # Try generic milling builder
-                        mill_builder = NXOpen.CAM.MillBuilder(work_part)
-                        write_log('Using NXOpen.CAM.MillBuilder')
-                        write_log(f"(MillBuilder) planned mill for {op['feature_id']} with tool {op['tool_id']}")
+                        builder = None
+                        for name in ('MillBuilder','RoughMillBuilder','ContourBuilder','PlanarMachiningBuilder'):
+                            if hasattr(NXOpen.CAM, name):
+                                BuilderClass = getattr(NXOpen.CAM, name)
+                                try:
+                                    builder = BuilderClass(work_part)
+                                    write_log(f'Instantiated {name}')
+                                    break
+                                except Exception:
+                                    builder = None
+                        if builder is None:
+                            write_log('No Mill builder available in this NX API; marking planned')
+                            created_ops.append({'feature_id': op['feature_id'], 'op':'mill', 'status':'planned'})
+                        else:
+                            set_builder_attr(builder, 'ToolName', op['tool_id'])
+                            set_builder_attr(builder, 'StepDown', float(op.get('stepdown_mm') or 0))
+                            set_builder_attr(builder, 'StepOver', float(op.get('stepover_mm') or 0))
+                            set_builder_attr(builder, 'SpindleSpeed', int(op.get('rpm')))
+                            set_builder_attr(builder, 'FeedRate', float(op.get('feed_mm_min') or 0))
+                            if hasattr(builder, 'Commit'):
+                                try:
+                                    builder.Commit()
+                                    write_log(f'Mill operation committed for {op["feature_id"]}')
+                                    created_ops.append({'feature_id': op['feature_id'], 'op':'mill', 'status':'created'})
+                                except Exception as e:
+                                    write_log('Failed to commit mill builder: ' + str(e))
+                                    created_ops.append({'feature_id': op['feature_id'], 'op':'mill', 'status':'planned'})
+                            else:
+                                write_log('Builder has no Commit method; operation left as planned')
+                                created_ops.append({'feature_id': op['feature_id'], 'op':'mill', 'status':'planned'})
                     except Exception:
-                        write_log('MillBuilder not available or failed; logging plan for manual creation')
-                        created_ops.append({'feature_id': op['feature_id'], 'op':'mill', 'status':'planned'})
+                        write_log('Exception during mill creation:')
+                        write_log(traceback.format_exc())
+                        created_ops.append({'feature_id': op['feature_id'], 'op':'mill', 'status':'error'})
                 else:
-                    write_log(f"Unknown op_type {op['op_type']} for {op.get('feature_id')}")
+                    write_log('Unknown operation type: ' + str(op.get('operation')))
                     created_ops.append({'feature_id': op.get('feature_id'), 'op':'unknown', 'status':'skipped'})
             except Exception:
-                write_log('Exception while attempting to create op for ' + str(op.get('feature_id')))
+                write_log('Unexpected exception in op loop:')
                 write_log(traceback.format_exc())
+                created_ops.append({'feature_id': op.get('feature_id'), 'op':'unknown', 'status':'error'})
         return {'created': True, 'created_ops': created_ops}
     except Exception as e:
         write_log('Unexpected exception in attempt_create_ops_in_nx: ' + str(e))
@@ -219,7 +255,7 @@ def attempt_create_ops_in_nx(plan):
 
 
 def run():
-    write_log('=== NX CAM generation journal started ===')
+    write_log('=== NX CAM generation journal (aggressive) started ===')
     selected = load_json(SELECTED_PATH) or []
     candidates = load_json(CANDIDATES_PATH) or []
     toollib = load_json(TOOLLIB_PATH) or {}
@@ -232,16 +268,13 @@ def run():
         'feed_for_material': 300
     }
 
-    # Build plan
     plan = build_plan(selected, candidates, toollib, defaults)
-    # Write plan JSON for inspection
     try:
         PLAN_PATH.write_text(json.dumps({'plan': plan}, ensure_ascii=False, indent=2), encoding='utf-8')
         write_log('Wrote CAM plan to ' + str(PLAN_PATH))
     except Exception as e:
         write_log('Failed to write CAM plan: ' + str(e))
 
-    # Attempt to create operations in NX (best-effort)
     try:
         res = attempt_create_ops_in_nx(plan)
         write_log('attempt_create_ops_in_nx result: ' + str(res))
@@ -249,13 +282,11 @@ def run():
         write_log('Exception calling attempt_create_ops_in_nx:')
         write_log(traceback.format_exc())
 
-    # Always write a human-friendly summary
     summary = {
-        'status': 'plan_created',
-        'message': 'CAM plan created. If CAM API calls succeeded some operations may have been created in the work part. Inspect NX CAM and simulate before post-processing.',
+        'status': 'plan_attempted',
+        'message': 'CAM plan created. Some operations may have been created in NX. Inspect NX CAM and simulate before post-processing.',
         'plan_path': str(PLAN_PATH),
-        'selected_summary': selected,
-        'nx_version': 'NX (report at runtime)'
+        'selected_summary': selected
     }
     try:
         SUMMARY_PATH.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
@@ -263,7 +294,7 @@ def run():
     except Exception as e:
         write_log('Failed to write summary: ' + str(e))
 
-    write_log('=== NX CAM generation journal finished ===')
+    write_log('=== NX CAM generation journal (aggressive) finished ===')
 
 
 if __name__ == '__main__':
